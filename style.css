@@ -126,16 +126,15 @@ label { display: block; font-size: .88rem; margin-bottom: .9rem; }
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-  gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1.1rem;
 }
 
 .card {
   position: relative;
   display: flex;
-  align-items: center;
-  gap: .9rem;
-  padding: 1rem;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -145,7 +144,48 @@ label { display: block; font-size: .88rem; margin-bottom: .9rem; }
   min-width: 0;
 }
 .card:hover { transform: translateY(-2px); border-color: var(--accent); background: #1c1f2b; }
-.card .info { min-width: 0; }
+.card .info { min-width: 0; padding: .75rem .95rem .85rem; }
+
+/* Prévia do site */
+.thumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  background: var(--panel-2);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+}
+.thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top center; display: block; }
+.thumb-letter { font-size: 2.6rem; font-weight: 700; color: #fff; }
+.thumb-busy {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: .35rem;
+  font-size: .75rem;
+  text-align: center;
+  background: #000a;
+  color: #fff;
+  animation: pulse 1.4s infinite;
+}
+@keyframes pulse { 50% { opacity: .55; } }
+
+.thumb-field { margin-bottom: .9rem; }
+.thumb-field .field-label { display: block; font-size: .88rem; margin-bottom: .35rem; }
+.thumb-field .thumb { border: 1px solid var(--border); border-radius: 10px; margin-bottom: .6rem; }
+
+.remember {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  justify-content: center;
+  font-size: .82rem;
+  color: var(--muted);
+  margin: 0 0 .9rem;
+  cursor: pointer;
+}
+.remember input { width: auto; margin: 0; accent-color: var(--accent); }
 .card .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .desc, .card .host {
   font-size: .8rem;
@@ -241,7 +281,6 @@ dialog h3 + p { margin-top: 0; }
 
 @media (max-width: 560px) {
   .row3 { grid-template-columns: 1fr; }
-  .grid { grid-template-columns: 1fr 1fr; }
-  .card { flex-direction: column; text-align: center; }
-  .card .info { width: 100%; }
+  .grid { grid-template-columns: 1fr 1fr; gap: .7rem; }
+  .card .info { padding: .55rem .65rem .65rem; }
 }

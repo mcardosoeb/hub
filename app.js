@@ -16,9 +16,12 @@ const state = {
   key: null,       // chave AES derivada do PIN (só em memória)
   salt: null,
   iter: ITERATIONS,
-  data: null,      // { title, links: [{ id, name, url, desc, icon }] }
+  data: null,      // { title, links: [{ id, name, url, desc, thumb, thumbAuto }] }
   dirty: false,    // há alterações não enviadas ao GitHub
   editing: false,
+  lockNote: '',    // aviso na tela de PIN
+  generating: new Set(),   // ids com prévia sendo gerada
+  thumbFailed: new Set(),  // ids cuja prévia falhou nesta sessão
 };
 
 /* ========= Base64 / criptografia ========= */
@@ -38,7 +41,7 @@ async function deriveKey(pin, salt, iterations) {
     { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     base,
     { name: 'AES-GCM', length: 256 },
-    false,
+    true,                       // exportável, para o "lembrar neste dispositivo"
     ['encrypt', 'decrypt']
   );
 }
@@ -49,11 +52,53 @@ async function encryptData(obj) {
   return { v: 1, kdf: 'PBKDF2-SHA256', iter: state.iter, salt: toB64(state.salt), iv: toB64(iv), data: toB64(ct) };
 }
 
+async function decryptWith(blob, key) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(blob.iv) }, key, fromB64(blob.data));
+  return JSON.parse(td.decode(pt));
+}
+
 async function decryptBlob(blob, pin) {
   const salt = fromB64(blob.salt);
   const key = await deriveKey(pin, salt, blob.iter);
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(blob.iv) }, key, fromB64(blob.data));
-  return { key, salt, iter: blob.iter, data: JSON.parse(td.decode(pt)) };
+  return { key, salt, iter: blob.iter, data: await decryptWith(blob, key) };
+}
+
+/* ========= Lembrar PIN por dispositivo + IP ========= */
+const LS_REMEMBER = 'hub.remember';
+
+async function getPublicIp() {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    return (await r.json()).ip || null;
+  } catch { return null; }
+}
+
+async function rememberDevice() {
+  const ip = await getPublicIp();
+  if (!ip) { toast('Não consegui identificar seu IP — o PIN não foi lembrado.', 'err'); return; }
+  const raw = await crypto.subtle.exportKey('raw', state.key);
+  localStorage.setItem(LS_REMEMBER, JSON.stringify({ key: toB64(raw), salt: toB64(state.salt), ip }));
+}
+
+const forgetDevice = () => localStorage.removeItem(LS_REMEMBER);
+
+// Desbloqueia sozinho se este navegador já guardou a chave e o IP atual é o mesmo de quando o PIN foi digitado
+async function tryRemembered() {
+  const rem = readJSON(LS_REMEMBER);
+  if (!rem || !state.blob) return false;
+  if (rem.salt !== state.blob.salt) { forgetDevice(); return false; }   // PIN foi trocado
+  const ip = await getPublicIp();
+  if (!ip) { state.lockNote = 'Não consegui verificar seu IP — digite o PIN.'; return false; }
+  if (ip !== rem.ip) { state.lockNote = 'Você está em outra rede (IP diferente) — digite o PIN.'; return false; }
+  try {
+    const key = await crypto.subtle.importKey('raw', fromB64(rem.key), 'AES-GCM', true, ['encrypt', 'decrypt']);
+    const data = await decryptWith(state.blob, key);
+    Object.assign(state, { key, salt: fromB64(state.blob.salt), iter: state.blob.iter, data });
+    return true;
+  } catch {
+    forgetDevice();
+    return false;
+  }
 }
 
 /* ========= Config / cache local ========= */
@@ -101,13 +146,11 @@ async function loadRemote() {
   // 1) API do GitHub: sempre a versão mais nova (o Pages demora ~1 min para atualizar)
   if (c.owner && c.repo) {
     try {
+      // formato "raw": funciona mesmo com o arquivo acima de 1 MB (as prévias ocupam espaço)
       const r = await fetch(`${apiUrl(c)}?ref=${encodeURIComponent(c.branch)}&t=${Date.now()}`, {
-        headers: ghHeaders(c), cache: 'no-store',
+        headers: { ...ghHeaders(c), Accept: 'application/vnd.github.raw+json' }, cache: 'no-store',
       });
-      if (r.ok) {
-        const j = await r.json();
-        return { blob: JSON.parse(atob(j.content.replace(/\s/g, ''))), sha: j.sha };
-      }
+      if (r.ok) return { blob: await r.json() };   // o sha é buscado na hora de salvar
     } catch { /* cai para o Pages */ }
   }
   // 2) Arquivo servido pelo próprio GitHub Pages
@@ -121,7 +164,7 @@ async function loadRemote() {
 
 async function fetchSha(c) {
   const r = await fetch(`${apiUrl(c)}?ref=${encodeURIComponent(c.branch)}&t=${Date.now()}`, {
-    headers: ghHeaders(c), cache: 'no-store',
+    headers: { ...ghHeaders(c), Accept: 'application/vnd.github.object+json' }, cache: 'no-store',
   });
   if (r.status === 404) return null;
   if (!r.ok) throw new Error(await ghError(r));
@@ -152,6 +195,7 @@ async function push(message) {
   const c = getCfg();
   if (!canSync(c)) return;
   try {
+    if (!state.sha) state.sha = await fetchSha(c);
     let r = await putFile(c, state.sha, message);
     if (r.status === 409 || r.status === 422) {
       // sha desatualizado (alterado em outro dispositivo) ou ausente: pega o atual e tenta de novo
@@ -204,7 +248,7 @@ function showLock() {
     pinBtn.textContent = 'Criar hub';
   } else {
     $('#lock-title').textContent = 'Hub';
-    $('#lock-sub').textContent = 'Digite seu PIN';
+    $('#lock-sub').textContent = state.lockNote || 'Digite seu PIN';
     pin2Input.hidden = true;
     pinBtn.textContent = 'Entrar';
   }
@@ -231,6 +275,7 @@ pinForm.addEventListener('submit', async (e) => {
       state.iter = ITERATIONS;
       state.key = await deriveKey(pin, state.salt, state.iter);
       state.data = { title: 'Meus Projetos', links: [] };
+      applyRemember();
       openHub();
       await persist('Cria hub');
     } else {
@@ -239,6 +284,7 @@ pinForm.addEventListener('submit', async (e) => {
         const res = await decryptBlob(state.blob, pin);
         Object.assign(state, res);
         state.data.links ||= [];
+        applyRemember();
         openHub();
       } catch {
         pinInput.value = '';
@@ -251,17 +297,37 @@ pinForm.addEventListener('submit', async (e) => {
   }
 });
 
+function applyRemember() {
+  if ($('#remember').checked) rememberDevice();
+  else forgetDevice();
+}
+
 /* ========= Hub ========= */
 function openHub() {
   pinInput.value = '';
   pin2Input.value = '';
   $('#lock').hidden = true;
   $('#hub').hidden = false;
+  state.data.links.forEach(migrateLink);
   render();
   updateBanner();
+  // gera, em segundo plano, a prévia dos projetos que ainda não têm imagem
+  generateThumbs(state.data.links.filter((l) => !l.thumb && !state.thumbFailed.has(l.id)));
 }
 
-$('#btn-lock').addEventListener('click', () => location.reload());
+// versões antigas guardavam "icon" (URL de imagem/emoji); imagens viram prévia, emoji vira reserva
+function migrateLink(l) {
+  if (l.icon && /^(https?:|data:image\/)/i.test(l.icon) && !l.thumb) {
+    l.thumb = l.icon;
+    l.thumbAuto = false;
+    delete l.icon;
+  }
+}
+
+$('#btn-lock').addEventListener('click', () => {
+  forgetDevice();
+  location.reload();
+});
 
 $('#btn-edit').addEventListener('click', () => {
   state.editing = !state.editing;
@@ -278,29 +344,6 @@ function colorFor(str) {
   return `hsl(${h} 55% 42%)`;
 }
 
-function fillIcon(box, icon, url, name) {
-  box.replaceChildren();
-  box.style.background = '';
-  const letter = () => {
-    box.replaceChildren();
-    box.textContent = (name || '?').trim().charAt(0).toUpperCase() || '?';
-    box.style.background = colorFor(name || url || '?');
-  };
-  const img = (src) => {
-    const i = new Image();
-    i.alt = '';
-    i.referrerPolicy = 'no-referrer';
-    i.onerror = letter;
-    i.src = src;
-    box.append(i);
-  };
-  if (icon && /^(https?:|data:image\/)/i.test(icon)) img(icon);
-  else if (icon) box.textContent = icon;               // emoji / texto curto
-  else {
-    try { img(`${new URL(url).origin}/favicon.ico`); } catch { letter(); }
-  }
-}
-
 function el(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -308,6 +351,106 @@ function el(tag, cls, text) {
   return e;
 }
 
+/* ========= Prévias (imagem gerada a partir do site) ========= */
+const THUMB_W = 480;
+const THUMB_H = 300;
+
+// Mostra a prévia; sem imagem (ou se falhar), mostra a inicial/emoji num fundo colorido
+function fillThumb(box, { thumb, icon, name, url }, busy) {
+  box.replaceChildren();
+  box.style.background = '';
+  const busyTag = () => { if (busy) box.append(el('span', 'thumb-busy', 'Gerando prévia…')); };
+  const fallback = () => {
+    box.replaceChildren();
+    const label = icon || (name || '?').trim().charAt(0).toUpperCase() || '?';
+    box.append(el('span', 'thumb-letter', label));
+    box.style.background = colorFor(name || url || '?');
+    busyTag();
+  };
+  if (!thumb) { fallback(); return; }
+  const img = new Image();
+  img.alt = '';
+  img.referrerPolicy = 'no-referrer';
+  img.onerror = fallback;
+  img.src = thumb;
+  box.append(img);
+  busyTag();
+}
+
+async function fetchBlob(url) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(45000) });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const b = await r.blob();
+  if (!b.type.startsWith('image/')) throw new Error('resposta não é imagem');
+  return b;
+}
+
+// Reduz/recorta para 480x300 em JPEG (fica salvo criptografado junto com os links)
+async function blobToThumb(blob, alignTop = true) {
+  const bmp = await createImageBitmap(blob);
+  const scale = Math.max(THUMB_W / bmp.width, THUMB_H / bmp.height);
+  const w = bmp.width * scale;
+  const h = bmp.height * scale;
+  const c = document.createElement('canvas');
+  c.width = THUMB_W;
+  c.height = THUMB_H;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, THUMB_W, THUMB_H);
+  ctx.drawImage(bmp, (THUMB_W - w) / 2, alignTop ? 0 : (THUMB_H - h) / 2, w, h);
+  bmp.close();
+  return c.toDataURL('image/jpeg', 0.72);
+}
+
+// Tira um "print" do site: Microlink e, se falhar, thum.io
+async function captureSite(url, force = false) {
+  const sources = [
+    async () => {
+      const q = new URLSearchParams({
+        url, screenshot: 'true', meta: 'false',
+        'viewport.width': '1280', 'viewport.height': '800', waitForTimeout: '2500',
+      });
+      if (force) q.set('force', 'true');
+      const r = await fetch(`https://api.microlink.io/?${q}`, { signal: AbortSignal.timeout(60000) });
+      const j = await r.json();
+      const shot = j && j.data && j.data.screenshot && j.data.screenshot.url;
+      if (!shot) throw new Error((j && j.message) || 'sem screenshot');
+      return fetchBlob(shot);
+    },
+    () => fetchBlob(`https://image.thum.io/get/width/1280/crop/800/noanimate/${force ? 'maxAge/1/' : ''}${url}`),
+  ];
+  for (const source of sources) {
+    try { return await blobToThumb(await source()); } catch { /* tenta o próximo */ }
+  }
+  throw new Error('não foi possível gerar a prévia');
+}
+
+async function generateThumbs(links, force = false) {
+  const todo = links.filter((l) => !state.generating.has(l.id));
+  if (!todo.length) return;
+  todo.forEach((l) => state.generating.add(l.id));
+  render();
+  let ok = 0;
+  let fail = 0;
+  for (const l of todo) {
+    try {
+      l.thumb = await captureSite(l.url, force);
+      l.thumbAuto = true;
+      state.thumbFailed.delete(l.id);
+      ok++;
+    } catch {
+      state.thumbFailed.add(l.id);
+      fail++;
+    }
+    state.generating.delete(l.id);
+    render();
+  }
+  const alive = todo.filter((l) => state.data.links.includes(l));   // ignora os removidos no meio do caminho
+  if (ok && alive.length) persist(ok === 1 ? `Gera prévia de ${todo[0].name}` : `Gera ${ok} prévias`);
+  if (fail) toast(`Não foi possível gerar ${fail} prévia(s). Use ⟳ no modo edição para tentar de novo.`, 'err');
+}
+
+/* ========= Cards ========= */
 function toolBtn(label, title, cls, fn) {
   const b = el('button', `tool ${cls || ''}`, label);
   b.type = 'button';
@@ -340,8 +483,8 @@ function cardEl(link) {
   a.target = '_blank';
   a.rel = 'noopener noreferrer';
 
-  const box = el('div', 'icon-box');
-  fillIcon(box, link.icon, link.url, link.name);
+  const thumb = el('div', 'thumb');
+  fillThumb(thumb, link, state.generating.has(link.id));
 
   const info = el('div', 'info');
   info.append(el('div', 'name', link.name));
@@ -353,11 +496,12 @@ function cardEl(link) {
   tools.append(
     toolBtn('◀', 'Mover para trás', '', () => move(link.id, -1)),
     toolBtn('▶', 'Mover para frente', '', () => move(link.id, 1)),
+    toolBtn('⟳', 'Gerar a prévia de novo', '', () => generateThumbs([link], true)),
     toolBtn('✎', 'Editar', '', () => openLinkDialog(link)),
     toolBtn('✕', 'Remover', 'del', () => removeLink(link)),
   );
 
-  a.append(box, info, tools);
+  a.append(thumb, info, tools);
   a.addEventListener('click', (e) => {
     if (state.editing) { e.preventDefault(); openLinkDialog(link); }
   });
@@ -365,6 +509,7 @@ function cardEl(link) {
 }
 
 function render() {
+  if (!state.data) return;
   const title = state.data.title || 'Meus Projetos';
   $('#hub-title').textContent = title;
   document.title = title;
@@ -399,10 +544,10 @@ function updateBanner() {
 const linkDlg = $('#link-dialog');
 const lf = $('#link-form');
 let editingId = null;
-let iconData = null;   // imagem enviada (data URL)
-
-const currentIcon = () => iconData || lf.icon.value.trim();
-const updatePreview = () => fillIcon($('#icon-preview'), currentIcon(), normalizeUrl(lf.url.value) || '', lf.name.value);
+let dlgThumb = '';        // imagem atual no diálogo
+let dlgThumbAuto = true;  // true = gerada do site (refaz se o link mudar)
+let dlgThumbUrl = '';     // link para o qual a imagem foi gerada
+let dlgBusy = false;
 
 function normalizeUrl(raw) {
   let v = (raw || '').trim();
@@ -414,18 +559,25 @@ function normalizeUrl(raw) {
   } catch { return null; }
 }
 
+function updatePreview() {
+  const box = $('#thumb-preview');
+  fillThumb(box, { thumb: dlgThumb, name: lf.name.value, url: lf.url.value }, dlgBusy);
+  if (!dlgThumb && !dlgBusy) box.append(el('span', 'thumb-busy', 'A imagem é gerada automaticamente ao salvar'));
+  $('#thumb-gen').disabled = dlgBusy;
+}
+
 function openLinkDialog(link) {
   editingId = link ? link.id : null;
   lf.reset();
-  iconData = null;
+  dlgThumb = link && link.thumb ? link.thumb : '';
+  dlgThumbAuto = link ? link.thumbAuto !== false : true;
+  dlgThumbUrl = link ? link.url : '';
+  dlgBusy = false;
   if (link) {
     lf.name.value = link.name;
     lf.url.value = link.url;
     lf.desc.value = link.desc || '';
-    if (link.icon && link.icon.startsWith('data:')) iconData = link.icon;
-    else lf.icon.value = link.icon || '';
   }
-  lf.icon.placeholder = iconData ? '(imagem enviada)' : 'https://…/logo.png ou 🚀';
   $('#link-dialog-title').textContent = link ? 'Editar projeto' : 'Adicionar projeto';
   $('#link-delete').hidden = !link;
   updatePreview();
@@ -434,77 +586,74 @@ function openLinkDialog(link) {
 }
 
 $('#btn-add').addEventListener('click', () => openLinkDialog(null));
-
 lf.name.addEventListener('input', updatePreview);
-lf.url.addEventListener('change', updatePreview);
-lf.icon.addEventListener('input', () => {
-  iconData = null;
-  lf.icon.placeholder = 'https://…/logo.png ou 🚀';
+
+$('#thumb-gen').addEventListener('click', async () => {
+  const url = normalizeUrl(lf.url.value);
+  if (!url) { toast('Preencha um link válido primeiro.', 'err'); lf.url.focus(); return; }
+  dlgBusy = true;
+  updatePreview();
+  try {
+    dlgThumb = await captureSite(url, true);
+    dlgThumbAuto = true;
+    dlgThumbUrl = url;
+  } catch (e) {
+    toast(`Falha: ${e.message}. O site pode estar fora do ar ou "dormindo".`, 'err');
+  }
+  dlgBusy = false;
   updatePreview();
 });
 
-$('#icon-clear').addEventListener('click', () => {
-  iconData = null;
-  lf.icon.value = '';
-  lf.icon.placeholder = 'https://…/logo.png ou 🚀';
-  updatePreview();
-});
-
-$('#icon-file').addEventListener('change', async (e) => {
+$('#thumb-file').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   e.target.value = '';
   if (!file) return;
   try {
-    iconData = await resizeImage(file, 128);
-    lf.icon.value = '';
-    lf.icon.placeholder = '(imagem enviada)';
+    dlgThumb = await blobToThumb(file, false);
+    dlgThumbAuto = false;
     updatePreview();
   } catch {
     toast('Não foi possível ler essa imagem.', 'err');
   }
 });
 
-function resizeImage(file, size) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const scale = Math.min(size / img.width, size / img.height, 1);
-      const w = Math.max(1, Math.round(img.width * scale));
-      const h = Math.max(1, Math.round(img.height * scale));
-      const c = document.createElement('canvas');
-      c.width = w; c.height = h;
-      c.getContext('2d').drawImage(img, 0, 0, w, h);
-      URL.revokeObjectURL(url);
-      resolve(c.toDataURL('image/png'));
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('imagem inválida')); };
-    img.src = url;
-  });
-}
+$('#thumb-clear').addEventListener('click', () => {
+  dlgThumb = '';
+  dlgThumbAuto = true;
+  updatePreview();
+});
 
 lf.addEventListener('submit', (e) => {
   e.preventDefault();
+  if (dlgBusy) { toast('Aguarde a prévia terminar de gerar.'); return; }
   const url = normalizeUrl(lf.url.value);
   if (!url) { toast('Link inválido. Use um endereço http(s).', 'err'); lf.url.focus(); return; }
+  const name = lf.name.value.trim();
+  if (!name) { lf.name.focus(); return; }
+
+  // imagem automática de outro link fica desatualizada: descarta para gerar de novo
+  const stale = dlgThumbAuto && dlgThumb && dlgThumbUrl !== url;
   const item = {
-    name: lf.name.value.trim(),
+    name,
     url,
     desc: lf.desc.value.trim(),
-    icon: currentIcon(),
+    thumb: stale ? '' : dlgThumb,
+    thumbAuto: dlgThumbAuto,
   };
-  if (!item.name) { lf.name.focus(); return; }
 
+  let link;
   if (editingId) {
-    const l = state.data.links.find((x) => x.id === editingId);
-    Object.assign(l, item);
-    persist(`Edita ${item.name}`);
+    link = state.data.links.find((x) => x.id === editingId);
+    Object.assign(link, item);
+    persist(`Edita ${name}`);
   } else {
-    state.data.links.push({ id: crypto.randomUUID(), ...item });
-    persist(`Adiciona ${item.name}`);
+    link = { id: crypto.randomUUID(), ...item };
+    state.data.links.push(link);
+    persist(`Adiciona ${name}`);
   }
   linkDlg.close();
   render();
+  if (!link.thumb) generateThumbs([link]);
 });
 
 $('#link-delete').addEventListener('click', () => {
@@ -556,6 +705,7 @@ sf.addEventListener('submit', async (e) => {
     state.iter = ITERATIONS;
     state.key = await deriveKey(np, state.salt, state.iter);
     changed = true;
+    if (readJSON(LS_REMEMBER)) rememberDevice();   // mantém este dispositivo lembrado com o PIN novo
   }
 
   setDlg.close();
@@ -607,6 +757,7 @@ async function init() {
       return;
     }
   }
+  if (await tryRemembered()) { openHub(); return; }
   showLock();
 }
 
